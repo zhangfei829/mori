@@ -486,6 +486,13 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
 
     if (type == RequestType::BATCH_PUT) {
       constexpr size_t kCopyChunk = 2ULL * 1024 * 1024;
+      // UMBP_SPDK_PROXY_TIMING=1 logs per-batch fill(memcpy into ring) vs
+      // wait(proxy SSD-write completion) split to localize the write bottleneck.
+      static const bool kProxyTiming = [] {
+        const char* e = std::getenv("UMBP_SPDK_PROXY_TIMING");
+        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+      }();
+      auto _fill_t0 = std::chrono::steady_clock::now();
       // Threads used to copy the batch payload into the shared ring.
       // Default 1 == original single-threaded streaming: the proxy overlaps its
       // SSD write with this copy via the monotonic `bytes_ready` cursor.  On a
@@ -544,6 +551,7 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
         desc->items_ready.store(static_cast<uint32_t>(sub_count), std::memory_order_release);
       }
       desc->bytes_ready.store(desc->total_data_size, std::memory_order_release);
+      auto _fill_t1 = std::chrono::steady_clock::now();
 
       int spin = 0;
       while (true) {
@@ -555,6 +563,18 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
           slot.state.store(static_cast<uint32_t>(SlotState::EMPTY), std::memory_order_release);
           return results;
         }
+      }
+      if (kProxyTiming) {
+        auto _t2 = std::chrono::steady_clock::now();
+        double fill_ms = std::chrono::duration<double, std::milli>(_fill_t1 - _fill_t0).count();
+        double wait_ms = std::chrono::duration<double, std::milli>(_t2 - _fill_t1).count();
+        double gb = static_cast<double>(desc->total_data_size) / (1024.0 * 1024.0 * 1024.0);
+        UMBP_LOG_INFO(
+            "SpdkProxyTier[TIMING] BatchPut bytes=%.3fGiB copy_threads=%d fill_ms=%.3f "
+            "wait_ms=%.3f fill_GiBps=%.2f wait_GiBps=%.2f total_GiBps=%.2f",
+            gb, kCopyThreads, fill_ms, wait_ms, fill_ms > 0 ? gb / (fill_ms / 1000.0) : 0.0,
+            wait_ms > 0 ? gb / (wait_ms / 1000.0) : 0.0,
+            (fill_ms + wait_ms) > 0 ? gb / ((fill_ms + wait_ms) / 1000.0) : 0.0);
       }
 
       for (int i = 0; i < sub_count; ++i) results[base + i] = (desc->entries[i].result != 0);
