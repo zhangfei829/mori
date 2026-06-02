@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
@@ -486,12 +487,6 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
 
     if (type == RequestType::BATCH_PUT) {
       constexpr size_t kCopyChunk = 2ULL * 1024 * 1024;
-      // UMBP_SPDK_PROXY_TIMING=1 logs per-batch fill(memcpy into ring) vs
-      // wait(proxy SSD-write completion) split to localize the write bottleneck.
-      static const bool kProxyTiming = [] {
-        const char* e = std::getenv("UMBP_SPDK_PROXY_TIMING");
-        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
-      }();
       auto _fill_t0 = std::chrono::steady_clock::now();
       // Threads used to copy the batch payload into the shared ring.
       // Default 1 == original single-threaded streaming: the proxy overlaps its
@@ -564,17 +559,26 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
           return results;
         }
       }
-      if (kProxyTiming) {
+      // DEBUG (unconditional, writes to a file to bypass stdout-capture / env /
+      // log-level uncertainty): one line per BatchPut so a single run confirms
+      // (a) this client path runs, (b) the COPY_THREADS env value the client
+      // actually sees, (c) fill(memcpy into ring) vs wait(proxy SSD write) split.
+      {
         auto _t2 = std::chrono::steady_clock::now();
         double fill_ms = std::chrono::duration<double, std::milli>(_fill_t1 - _fill_t0).count();
         double wait_ms = std::chrono::duration<double, std::milli>(_t2 - _fill_t1).count();
         double gb = static_cast<double>(desc->total_data_size) / (1024.0 * 1024.0 * 1024.0);
-        UMBP_LOG_INFO(
-            "SpdkProxyTier[TIMING] BatchPut bytes=%.3fGiB copy_threads=%d fill_ms=%.3f "
-            "wait_ms=%.3f fill_GiBps=%.2f wait_GiBps=%.2f total_GiBps=%.2f",
-            gb, kCopyThreads, fill_ms, wait_ms, fill_ms > 0 ? gb / (fill_ms / 1000.0) : 0.0,
-            wait_ms > 0 ? gb / (wait_ms / 1000.0) : 0.0,
-            (fill_ms + wait_ms) > 0 ? gb / ((fill_ms + wait_ms) / 1000.0) : 0.0);
+        const char* ct_env = std::getenv("UMBP_SPDK_PROXY_COPY_THREADS");
+        static FILE* _dbgf = std::fopen("/tmp/spdk_proxy_tier_dbg.log", "a");
+        if (_dbgf) {
+          std::fprintf(_dbgf,
+                       "BatchPut bytes=%.3fGiB copy_threads_env=%s kCopyThreads=%d sub_count=%d "
+                       "fill_ms=%.3f wait_ms=%.3f fill_GiBps=%.2f wait_GiBps=%.2f\n",
+                       gb, ct_env ? ct_env : "(unset)", kCopyThreads, sub_count, fill_ms, wait_ms,
+                       fill_ms > 0 ? gb / (fill_ms / 1000.0) : 0.0,
+                       wait_ms > 0 ? gb / (wait_ms / 1000.0) : 0.0);
+          std::fflush(_dbgf);
+        }
       }
 
       for (int i = 0; i < sub_count; ++i) results[base + i] = (desc->entries[i].result != 0);
