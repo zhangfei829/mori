@@ -486,22 +486,62 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
 
     if (type == RequestType::BATCH_PUT) {
       constexpr size_t kCopyChunk = 2ULL * 1024 * 1024;
-      for (int i = 0; i < sub_count; ++i) {
-        int gi = base + i;
-        if (!data_ptrs.empty() && data_ptrs[gi] != nullptr) {
-          const char* src = static_cast<const char*>(data_ptrs[gi]);
-          char* dst = write_target + desc->entries[i].data_offset;
-          size_t item_sz = sizes[gi];
-          size_t copied = 0;
-          while (copied < item_sz) {
-            size_t chunk = std::min(kCopyChunk, item_sz - copied);
-            std::memcpy(dst + copied, src + copied, chunk);
-            copied += chunk;
-            desc->bytes_ready.store(desc->entries[i].data_offset + copied,
-                                    std::memory_order_release);
+      // Threads used to copy the batch payload into the shared ring.
+      // Default 1 == original single-threaded streaming: the proxy overlaps its
+      // SSD write with this copy via the monotonic `bytes_ready` cursor.  On a
+      // fast backend (e.g. RAID0, write >= ~6 GB/s) the single-thread memcpy
+      // (~3.4 GB/s, pinned host -> hugetlb shm) becomes the pipeline bottleneck,
+      // so the proxy is starved and RAID0/io_workers can't help.  Setting
+      // UMBP_SPDK_PROXY_COPY_THREADS>1 parallelizes the fill; `bytes_ready` is
+      // then published once (no per-chunk overlap), which is still a net win
+      // because the copy was the limiting stage.
+      static const int kCopyThreads = [] {
+        const char* e = std::getenv("UMBP_SPDK_PROXY_COPY_THREADS");
+        int v = e ? std::atoi(e) : 1;
+        return v < 1 ? 1 : v;
+      }();
+
+      if (kCopyThreads <= 1 || sub_count <= 1 || data_ptrs.empty()) {
+        for (int i = 0; i < sub_count; ++i) {
+          int gi = base + i;
+          if (!data_ptrs.empty() && data_ptrs[gi] != nullptr) {
+            const char* src = static_cast<const char*>(data_ptrs[gi]);
+            char* dst = write_target + desc->entries[i].data_offset;
+            size_t item_sz = sizes[gi];
+            size_t copied = 0;
+            while (copied < item_sz) {
+              size_t chunk = std::min(kCopyChunk, item_sz - copied);
+              std::memcpy(dst + copied, src + copied, chunk);
+              copied += chunk;
+              desc->bytes_ready.store(desc->entries[i].data_offset + copied,
+                                      std::memory_order_release);
+            }
           }
+          desc->items_ready.store(static_cast<uint32_t>(i + 1), std::memory_order_release);
         }
-        desc->items_ready.store(static_cast<uint32_t>(i + 1), std::memory_order_release);
+      } else {
+        // Parallel fill: split items across threads, full per-item memcpy.
+        // bytes_ready / items_ready are published once below, after all copies.
+        const int nt = std::min(kCopyThreads, sub_count);
+        auto copy_range = [&](int i0, int i1) {
+          for (int i = i0; i < i1; ++i) {
+            int gi = base + i;
+            if (data_ptrs[gi] == nullptr) continue;
+            std::memcpy(write_target + desc->entries[i].data_offset, data_ptrs[gi], sizes[gi]);
+          }
+        };
+        std::vector<std::thread> copy_threads;
+        copy_threads.reserve(nt - 1);
+        for (int t = 0; t < nt; ++t) {
+          int i0 = static_cast<int>(static_cast<long long>(sub_count) * t / nt);
+          int i1 = static_cast<int>(static_cast<long long>(sub_count) * (t + 1) / nt);
+          if (t < nt - 1)
+            copy_threads.emplace_back(copy_range, i0, i1);
+          else
+            copy_range(i0, i1);
+        }
+        for (auto& th : copy_threads) th.join();
+        desc->items_ready.store(static_cast<uint32_t>(sub_count), std::memory_order_release);
       }
       desc->bytes_ready.store(desc->total_data_size, std::memory_order_release);
 
