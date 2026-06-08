@@ -132,10 +132,13 @@ class DRAMTier : public TierBackend {
   // Number of worker threads used by ReadBatchIntoPtr for parallel memcpy.
   size_t read_threads_;
   // CPUs this process is allowed to run on (from sched_getaffinity at
-  // construction). Batch-read workers are pinned round-robin onto distinct
-  // entries so they land on separate physical cores (low ids first, avoiding
-  // SMT-sibling collisions) and never exceed the operator's core budget.
+  // construction), and the de-duplicated physical-core representatives within
+  // that set (one SMT sibling per core). Batch-read workers are pinned with a
+  // stride across allowed_phys_cpus_ so they spread across EPYC CCDs (separate
+  // GMI links) instead of piling onto one CCD, and never exceed the operator's
+  // physical-core budget.
   std::vector<int> allowed_cpus_;
+  std::vector<int> allowed_phys_cpus_;
   // Whether to pin batch-read workers (UMBP_DRAM_READ_PIN, default on).
   bool pin_threads_;
 

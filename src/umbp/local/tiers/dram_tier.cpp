@@ -33,10 +33,47 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 
 namespace mori::umbp {
+
+namespace {
+
+// Parse a Linux cpulist string like "0-3,8,12-15" into individual cpu ids.
+std::vector<int> ParseCpuList(const std::string& s) {
+  std::vector<int> out;
+  std::stringstream ss(s);
+  std::string tok;
+  while (std::getline(ss, tok, ',')) {
+    if (tok.empty()) continue;
+    auto dash = tok.find('-');
+    if (dash == std::string::npos) {
+      out.push_back(std::atoi(tok.c_str()));
+    } else {
+      int a = std::atoi(tok.substr(0, dash).c_str());
+      int b = std::atoi(tok.substr(dash + 1).c_str());
+      for (int i = a; i <= b; ++i) out.push_back(i);
+    }
+  }
+  return out;
+}
+
+// SMT siblings of |cpu| (incl. itself) from sysfs; falls back to {cpu}.
+std::vector<int> ReadThreadSiblings(int cpu) {
+  std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                  "/topology/thread_siblings_list");
+  if (!f) return {cpu};
+  std::string line;
+  std::getline(f, line);
+  auto v = ParseCpuList(line);
+  return v.empty() ? std::vector<int>{cpu} : v;
+}
+
+}  // namespace
 
 DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, bool use_hugepages,
                    size_t hugepage_size, int numa_node, bool prefault)
@@ -110,10 +147,27 @@ DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, b
       if (CPU_ISSET(c, &set)) allowed_cpus_.push_back(c);
     }
   }
-  // Never spawn more memcpy threads than the cores we're allowed to use, so
-  // batch reads don't oversubscribe the inference engine's CPU budget.
-  if (pin_threads_ && !allowed_cpus_.empty() && read_threads_ > allowed_cpus_.size()) {
-    read_threads_ = allowed_cpus_.size();
+
+  // De-duplicate to one representative (lowest sibling) per physical core, so
+  // pinning never lands two memcpy threads on SMT siblings of the same core.
+  std::set<int> allowed_set(allowed_cpus_.begin(), allowed_cpus_.end());
+  std::set<int> covered;
+  for (int c : allowed_cpus_) {
+    if (covered.count(c)) continue;
+    auto sibs = ReadThreadSiblings(c);
+    int rep = c;
+    for (int s : sibs) rep = std::min(rep, s);
+    for (int s : sibs) covered.insert(s);
+    if (allowed_set.count(rep)) allowed_phys_cpus_.push_back(rep);
+  }
+  if (allowed_phys_cpus_.empty()) allowed_phys_cpus_ = allowed_cpus_;
+  std::sort(allowed_phys_cpus_.begin(), allowed_phys_cpus_.end());
+
+  // Never spawn more memcpy threads than the physical cores we're allowed to
+  // use, so batch reads don't oversubscribe the inference engine's CPU budget.
+  if (pin_threads_ && !allowed_phys_cpus_.empty() &&
+      read_threads_ > allowed_phys_cpus_.size()) {
+    read_threads_ = allowed_phys_cpus_.size();
   }
 }
 
@@ -330,7 +384,8 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
   };
 
   const size_t nthreads = std::min<size_t>(read_threads_, num_hits);
-  const bool pin = pin_threads_ && !allowed_cpus_.empty();
+  const bool pin = pin_threads_ && !allowed_phys_cpus_.empty();
+  const size_t P = allowed_phys_cpus_.size();
   if (nthreads <= 1) {
     do_copy(0, num_hits, -1);
   } else {
@@ -341,7 +396,9 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
       const size_t b = t * chunk;
       if (b >= num_hits) break;
       const size_t e = std::min(num_hits, b + chunk);
-      const int cpu = pin ? allowed_cpus_[t % allowed_cpus_.size()] : -1;
+      // Stride across physical cores so workers spread over EPYC CCDs (distinct
+      // GMI links) rather than piling onto one CCD.
+      const int cpu = pin ? allowed_phys_cpus_[(t * P / nthreads) % P] : -1;
       workers.emplace_back(do_copy, b, e, cpu);
     }
     do_copy(0, std::min(num_hits, chunk), -1);  // main thread takes the first chunk
