@@ -131,6 +131,13 @@ class DRAMTier : public TierBackend {
   mutable std::mutex lru_mu_;
   // Number of worker threads used by ReadBatchIntoPtr for parallel memcpy.
   size_t read_threads_;
+  // CPUs this process is allowed to run on (from sched_getaffinity at
+  // construction). Batch-read workers are pinned round-robin onto distinct
+  // entries so they land on separate physical cores (low ids first, avoiding
+  // SMT-sibling collisions) and never exceed the operator's core budget.
+  std::vector<int> allowed_cpus_;
+  // Whether to pin batch-read workers (UMBP_DRAM_READ_PIN, default on).
+  bool pin_threads_;
 
   size_t Allocate(size_t size);                 // Allocate from free_list_
   void Deallocate(size_t offset, size_t size);  // Return to free_list_

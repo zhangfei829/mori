@@ -19,9 +19,14 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE  // for sched_getaffinity / sched_setaffinity / CPU_* macros
+#endif
+
 #include "umbp/local/tiers/dram_tier.h"
 
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -90,6 +95,26 @@ DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, b
   }
   unsigned hw = std::thread::hardware_concurrency();
   if (hw > 0 && read_threads_ > hw) read_threads_ = hw;
+
+  // Worker CPU pinning (default on). Respect the operator's core budget by
+  // reading our own affinity mask (taskset / cgroup) rather than assuming the
+  // whole machine.
+  pin_threads_ = true;
+  if (const char* env = std::getenv("UMBP_DRAM_READ_PIN")) {
+    pin_threads_ = !(env[0] == '0');
+  }
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+      if (CPU_ISSET(c, &set)) allowed_cpus_.push_back(c);
+    }
+  }
+  // Never spawn more memcpy threads than the cores we're allowed to use, so
+  // batch reads don't oversubscribe the inference engine's CPU budget.
+  if (pin_threads_ && !allowed_cpus_.empty() && read_threads_ > allowed_cpus_.size()) {
+    read_threads_ = allowed_cpus_.size();
+  }
 }
 
 DRAMTier::~DRAMTier() {
@@ -287,7 +312,17 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
   const size_t num_hits = hits.size();
   if (num_hits == 0) return results;
 
-  auto do_copy = [&](size_t begin, size_t end) {
+  // |cpu| >= 0 pins the calling thread to that core before copying. Workers
+  // are pinned to distinct entries of allowed_cpus_ (low ids first => separate
+  // physical cores, avoiding SMT-sibling contention); the main thread runs its
+  // chunk unpinned to avoid disturbing the caller's affinity.
+  auto do_copy = [&](size_t begin, size_t end, int cpu) {
+    if (cpu >= 0) {
+      cpu_set_t s;
+      CPU_ZERO(&s);
+      CPU_SET(cpu, &s);
+      sched_setaffinity(0, sizeof(s), &s);
+    }
     for (size_t k = begin; k < end; ++k) {
       const size_t i = hits[k];
       std::memcpy(reinterpret_cast<void*>(dst_ptrs[i]), srcs[i], sizes[i]);
@@ -295,8 +330,9 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
   };
 
   const size_t nthreads = std::min<size_t>(read_threads_, num_hits);
+  const bool pin = pin_threads_ && !allowed_cpus_.empty();
   if (nthreads <= 1) {
-    do_copy(0, num_hits);
+    do_copy(0, num_hits, -1);
   } else {
     const size_t chunk = (num_hits + nthreads - 1) / nthreads;
     std::vector<std::thread> workers;
@@ -305,9 +341,10 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
       const size_t b = t * chunk;
       if (b >= num_hits) break;
       const size_t e = std::min(num_hits, b + chunk);
-      workers.emplace_back(do_copy, b, e);
+      const int cpu = pin ? allowed_cpus_[t % allowed_cpus_.size()] : -1;
+      workers.emplace_back(do_copy, b, e, cpu);
     }
-    do_copy(0, std::min(num_hits, chunk));  // main thread takes the first chunk
+    do_copy(0, std::min(num_hits, chunk), -1);  // main thread takes the first chunk
     for (auto& w : workers) w.join();
   }
 
