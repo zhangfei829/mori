@@ -26,6 +26,7 @@
 #include <list>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -51,6 +52,11 @@ class DRAMTier : public TierBackend {
   // Upper layer (LocalStorageManager) is responsible for demoting keys.
   bool Write(const std::string& key, const void* data, size_t size) override;
   bool ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size) override;
+  // Multi-threaded batch read: parallel memcpy of many keys to break the
+  // single-core memcpy ceiling. Reads run concurrently under a shared lock.
+  std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                     const std::vector<uintptr_t>& dst_ptrs,
+                                     const std::vector<size_t>& sizes) override;
   bool Exists(const std::string& key) const override;
   bool Evict(const std::string& key) override;
   std::pair<size_t, size_t> Capacity() const override;
@@ -100,7 +106,15 @@ class DRAMTier : public TierBackend {
   };
   std::list<FreeBlock> free_list_;
 
-  mutable std::mutex mu_;
+  // Reader-writer lock: reads take a shared lock (concurrent); writes
+  // (Write/Evict/Clear) take it exclusively. Protects base_ptr_/slots_/
+  // free_list_/used_.
+  mutable std::shared_mutex mu_;
+  // Separate lock for LRU structures so concurrent readers updating LRU under a
+  // shared mu_ don't race each other.
+  mutable std::mutex lru_mu_;
+  // Threads used by ReadBatchIntoPtr for parallel memcpy.
+  int read_threads_;
 
   size_t Allocate(size_t size);                 // Allocate from free_list_
   void Deallocate(size_t offset, size_t size);  // Return to free_list_
