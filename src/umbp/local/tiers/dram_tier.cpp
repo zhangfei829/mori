@@ -161,9 +161,10 @@ DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, b
   // Initialize free list with entire capacity
   free_list_.push_back({0, capacity_});
 
-  // Parallel-memcpy fan-out for batch reads. Default 8, overridable via env,
-  // capped to the hardware thread count.
-  read_threads_ = 8;
+  // Parallel-memcpy fan-out for batch reads. Default 4 (with non-temporal
+  // stores that is ~76 GiB/s on EPYC node-local DRAM, comfortably above the
+  // downstream HBM-DMA demand), overridable via env, capped to hw threads.
+  read_threads_ = 4;
   if (const char* env = std::getenv("UMBP_DRAM_READ_THREADS")) {
     long v = std::atol(env);
     if (v > 0) read_threads_ = static_cast<size_t>(v);
