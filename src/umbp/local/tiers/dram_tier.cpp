@@ -26,8 +26,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 
 namespace mori::umbp {
 
@@ -78,6 +80,16 @@ DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, b
 
   // Initialize free list with entire capacity
   free_list_.push_back({0, capacity_});
+
+  // Parallel-memcpy fan-out for batch reads. Default 8, overridable via env,
+  // capped to the hardware thread count.
+  read_threads_ = 8;
+  if (const char* env = std::getenv("UMBP_DRAM_READ_THREADS")) {
+    long v = std::atol(env);
+    if (v > 0) read_threads_ = static_cast<size_t>(v);
+  }
+  unsigned hw = std::thread::hardware_concurrency();
+  if (hw > 0 && read_threads_ > hw) read_threads_ = hw;
 }
 
 DRAMTier::~DRAMTier() {
@@ -146,9 +158,11 @@ void DRAMTier::TouchLRU(const std::string& key) {
 }
 
 void DRAMTier::EvictLRU() {
+  // Caller must hold data_mu_ (unique). LRU structures guarded by lru_mu_.
+  std::lock_guard<std::mutex> llock(lru_mu_);
   if (lru_list_.empty()) return;
 
-  const std::string& victim = lru_list_.back();
+  const std::string victim = lru_list_.back();
   auto slot_it = slots_.find(victim);
   if (slot_it != slots_.end()) {
     Deallocate(slot_it->second.offset, slot_it->second.size);
@@ -160,7 +174,7 @@ void DRAMTier::EvictLRU() {
 }
 
 bool DRAMTier::Write(const std::string& key, const void* data, size_t size) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::unique_lock<std::shared_mutex> lock(data_mu_);
 
   // If key already exists, free its old slot first
   auto existing = slots_.find(key);
@@ -168,6 +182,7 @@ bool DRAMTier::Write(const std::string& key, const void* data, size_t size) {
     Deallocate(existing->second.offset, existing->second.size);
     used_ -= existing->second.size;
     slots_.erase(existing);
+    std::lock_guard<std::mutex> llock(lru_mu_);
     auto lru_it = lru_map_.find(key);
     if (lru_it != lru_map_.end()) {
       lru_list_.erase(lru_it->second);
@@ -185,12 +200,18 @@ bool DRAMTier::Write(const std::string& key, const void* data, size_t size) {
   std::memcpy(static_cast<char*>(base_ptr_) + offset, data, size);
   slots_[key] = {offset, size};
   used_ += size;
-  TouchLRU(key);
+  {
+    std::lock_guard<std::mutex> llock(lru_mu_);
+    TouchLRU(key);
+  }
   return true;
 }
 
 bool DRAMTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size) {
-  std::lock_guard<std::mutex> lock(mu_);
+  // Shared lock: concurrent reads proceed in parallel. The unique-locking
+  // Write/Evict/Clear paths are excluded for the duration, so the resolved
+  // slot memory is stable across the memcpy.
+  std::shared_lock<std::shared_mutex> lock(data_mu_);
 
   auto it = slots_.find(key);
   if (it == slots_.end()) return false;
@@ -202,23 +223,29 @@ bool DRAMTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t siz
 
   std::memcpy(reinterpret_cast<void*>(dst_ptr), static_cast<char*>(base_ptr_) + it->second.offset,
               size);
-  TouchLRU(key);
+  {
+    std::lock_guard<std::mutex> llock(lru_mu_);
+    TouchLRU(key);
+  }
   return true;
 }
 
 const void* DRAMTier::ReadPtr(const std::string& key, size_t* out_size) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_lock<std::shared_mutex> lock(data_mu_);
 
   auto it = slots_.find(key);
   if (it == slots_.end()) return nullptr;
 
   if (out_size) *out_size = it->second.size;
-  TouchLRU(key);
+  {
+    std::lock_guard<std::mutex> llock(lru_mu_);
+    TouchLRU(key);
+  }
   return static_cast<char*>(base_ptr_) + it->second.offset;
 }
 
 std::vector<char> DRAMTier::Read(const std::string& key) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_lock<std::shared_mutex> lock(data_mu_);
 
   auto it = slots_.find(key);
   if (it == slots_.end()) return {};
@@ -226,23 +253,89 @@ std::vector<char> DRAMTier::Read(const std::string& key) {
   size_t sz = it->second.size;
   std::vector<char> buf(sz);
   std::memcpy(buf.data(), static_cast<char*>(base_ptr_) + it->second.offset, sz);
-  TouchLRU(key);
+  {
+    std::lock_guard<std::mutex> llock(lru_mu_);
+    TouchLRU(key);
+  }
   return buf;
+}
+
+std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                             const std::vector<uintptr_t>& dst_ptrs,
+                                             const std::vector<size_t>& sizes) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (n == 0) return results;
+
+  std::vector<const char*> srcs(n, nullptr);
+  std::vector<size_t> hits;
+  hits.reserve(n);
+
+  // Hold the shared lock for the entire operation (including the parallel
+  // memcpy below). Workers are joined before the lock is released, so no
+  // unique-locking writer/evictor can move or reuse a slot mid-copy.
+  std::shared_lock<std::shared_mutex> lock(data_mu_);
+
+  for (size_t i = 0; i < n; ++i) {
+    auto it = slots_.find(keys[i]);
+    if (it == slots_.end()) continue;
+    if (sizes[i] != it->second.size) continue;  // size mismatch => caller bug
+    srcs[i] = static_cast<const char*>(base_ptr_) + it->second.offset;
+    hits.push_back(i);
+  }
+
+  const size_t num_hits = hits.size();
+  if (num_hits == 0) return results;
+
+  auto do_copy = [&](size_t begin, size_t end) {
+    for (size_t k = begin; k < end; ++k) {
+      const size_t i = hits[k];
+      std::memcpy(reinterpret_cast<void*>(dst_ptrs[i]), srcs[i], sizes[i]);
+    }
+  };
+
+  const size_t nthreads = std::min<size_t>(read_threads_, num_hits);
+  if (nthreads <= 1) {
+    do_copy(0, num_hits);
+  } else {
+    const size_t chunk = (num_hits + nthreads - 1) / nthreads;
+    std::vector<std::thread> workers;
+    workers.reserve(nthreads - 1);
+    for (size_t t = 1; t < nthreads; ++t) {
+      const size_t b = t * chunk;
+      if (b >= num_hits) break;
+      const size_t e = std::min(num_hits, b + chunk);
+      workers.emplace_back(do_copy, b, e);
+    }
+    do_copy(0, std::min(num_hits, chunk));  // main thread takes the first chunk
+    for (auto& w : workers) w.join();
+  }
+
+  {
+    std::lock_guard<std::mutex> llock(lru_mu_);
+    for (size_t k = 0; k < num_hits; ++k) {
+      const size_t i = hits[k];
+      results[i] = true;
+      TouchLRU(keys[i]);
+    }
+  }
+  return results;
 }
 
 TierCapabilities DRAMTier::Capabilities() const {
   TierCapabilities caps;
   caps.zero_copy_read = true;
+  caps.batch_read = true;
   return caps;
 }
 
 bool DRAMTier::Exists(const std::string& key) const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_lock<std::shared_mutex> lock(data_mu_);
   return slots_.count(key) > 0;
 }
 
 bool DRAMTier::Evict(const std::string& key) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::unique_lock<std::shared_mutex> lock(data_mu_);
 
   auto it = slots_.find(key);
   if (it == slots_.end()) return false;
@@ -251,6 +344,7 @@ bool DRAMTier::Evict(const std::string& key) {
   used_ -= it->second.size;
   slots_.erase(it);
 
+  std::lock_guard<std::mutex> llock(lru_mu_);
   auto lru_it = lru_map_.find(key);
   if (lru_it != lru_map_.end()) {
     lru_list_.erase(lru_it->second);
@@ -260,23 +354,25 @@ bool DRAMTier::Evict(const std::string& key) {
 }
 
 std::pair<size_t, size_t> DRAMTier::Capacity() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_lock<std::shared_mutex> lock(data_mu_);
   return {used_, capacity_};
 }
 
 void DRAMTier::Clear() {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::unique_lock<std::shared_mutex> lock(data_mu_);
   slots_.clear();
-  lru_list_.clear();
-  lru_map_.clear();
   free_list_.clear();
   free_list_.push_back({0, capacity_});
   used_ = 0;
+
+  std::lock_guard<std::mutex> llock(lru_mu_);
+  lru_list_.clear();
+  lru_map_.clear();
 }
 
 std::vector<std::string> DRAMTier::GetLRUCandidates(size_t max_candidates) const {
   if (max_candidates == 0) max_candidates = 1;
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<std::mutex> llock(lru_mu_);
   std::vector<std::string> result;
   result.reserve(std::min(max_candidates, lru_list_.size()));
   // Walk from the back (LRU end) up to max_candidates entries.
@@ -288,13 +384,13 @@ std::vector<std::string> DRAMTier::GetLRUCandidates(size_t max_candidates) const
 }
 
 std::string DRAMTier::GetLRUKey() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::lock_guard<std::mutex> llock(lru_mu_);
   if (lru_list_.empty()) return "";
   return lru_list_.back();
 }
 
 std::optional<size_t> DRAMTier::GetSlotOffset(const std::string& key) const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_lock<std::shared_mutex> lock(data_mu_);
   auto it = slots_.find(key);
   if (it == slots_.end()) return std::nullopt;
   return it->second.offset;

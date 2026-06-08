@@ -26,6 +26,7 @@
 #include <list>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -68,6 +69,15 @@ class DRAMTier : public TierBackend {
   // Extended interface overrides
   TierCapabilities Capabilities() const override;
   std::vector<char> Read(const std::string& key) override;
+
+  // Multi-threaded batch read: resolves all slot offsets under a shared lock,
+  // then parallelizes the per-key memcpy across a thread pool to break the
+  // single-core std::memcpy bandwidth ceiling. Thread count is controlled by
+  // the UMBP_DRAM_READ_THREADS environment variable (default 8, capped to
+  // hardware_concurrency).
+  std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                     const std::vector<uintptr_t>& dst_ptrs,
+                                     const std::vector<size_t>& sizes) override;
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
   std::optional<std::string> GetLocationId(const std::string& key) const override;
@@ -111,12 +121,22 @@ class DRAMTier : public TierBackend {
   };
   std::list<FreeBlock> free_list_;
 
-  mutable std::mutex mu_;
+  // Guards the allocator state (slots_, free_list_, used_). Reads take a
+  // shared lock so multiple concurrent reads (incl. parallel batch memcpy)
+  // proceed in parallel; Write/Evict/Clear take a unique lock.
+  mutable std::shared_mutex data_mu_;
+  // Guards the LRU bookkeeping (lru_list_, lru_map_) only. Kept separate so
+  // that concurrent shared-lock readers can update LRU without serializing on
+  // the data lock. Lock ordering is always data_mu_ -> lru_mu_.
+  mutable std::mutex lru_mu_;
+  // Number of worker threads used by ReadBatchIntoPtr for parallel memcpy.
+  size_t read_threads_;
 
   size_t Allocate(size_t size);                 // Allocate from free_list_
   void Deallocate(size_t offset, size_t size);  // Return to free_list_
   void EvictLRU();                              // Evict least recently used
-  void TouchLRU(const std::string& key);        // Update LRU position
+  // Update LRU position. Caller MUST hold lru_mu_.
+  void TouchLRU(const std::string& key);
 };
 
 }  // namespace mori::umbp
