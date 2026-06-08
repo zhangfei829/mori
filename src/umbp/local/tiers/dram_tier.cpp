@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -39,9 +40,46 @@
 #include <stdexcept>
 #include <thread>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 namespace mori::umbp {
 
 namespace {
+
+#if defined(__x86_64__) || defined(__i386__)
+// Non-temporal (streaming) copy: writes bypass the cache, skipping the
+// read-for-ownership of destination lines that a normal store incurs. Ideal
+// when the destination (L2 staging buffer) is written once and then DMA'd to
+// HBM without being re-read by the CPU. Handles unaligned head/tail.
+__attribute__((target("avx2"))) void NtCopy(char* d, const char* s, size_t n) {
+  size_t head = (32 - (reinterpret_cast<uintptr_t>(d) & 31)) & 31;
+  if (head > n) head = n;
+  std::memcpy(d, s, head);
+  size_t i = head;
+  for (; i + 128 <= n; i += 128) {
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+    __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 32));
+    __m256i c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 64));
+    __m256i e = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 96));
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i), a);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 32), b);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 64), c);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 96), e);
+  }
+  for (; i + 32 <= n; i += 32) {
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i), a);
+  }
+  if (i < n) std::memcpy(d + i, s + i, n - i);
+  _mm_sfence();
+}
+bool NtSupported() { return __builtin_cpu_supports("avx2"); }
+#else
+void NtCopy(char* d, const char* s, size_t n) { std::memcpy(d, s, n); }
+bool NtSupported() { return false; }
+#endif
 
 // Parse a Linux cpulist string like "0-3,8,12-15" into individual cpu ids.
 std::vector<int> ParseCpuList(const std::string& s) {
@@ -139,6 +177,10 @@ DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, b
   pin_threads_ = true;
   if (const char* env = std::getenv("UMBP_DRAM_READ_PIN")) {
     pin_threads_ = !(env[0] == '0');
+  }
+  nt_copy_ = NtSupported();
+  if (const char* env = std::getenv("UMBP_DRAM_NT_COPY")) {
+    nt_copy_ = nt_copy_ && !(env[0] == '0');
   }
   cpu_set_t set;
   CPU_ZERO(&set);
@@ -379,7 +421,12 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
     }
     for (size_t k = begin; k < end; ++k) {
       const size_t i = hits[k];
-      std::memcpy(reinterpret_cast<void*>(dst_ptrs[i]), srcs[i], sizes[i]);
+      char* d = reinterpret_cast<char*>(dst_ptrs[i]);
+      if (nt_copy_) {
+        NtCopy(d, srcs[i], sizes[i]);
+      } else {
+        std::memcpy(d, srcs[i], sizes[i]);
+      }
     }
   };
 

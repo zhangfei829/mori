@@ -141,6 +141,10 @@ class DRAMTier : public TierBackend {
   std::vector<int> allowed_phys_cpus_;
   // Whether to pin batch-read workers (UMBP_DRAM_READ_PIN, default on).
   bool pin_threads_;
+  // Use non-temporal (streaming) stores in batch reads to skip destination
+  // read-for-ownership (UMBP_DRAM_NT_COPY, default on where AVX2 is available).
+  // Safe because the batch-read destination is DMA'd to HBM, never CPU-reread.
+  bool nt_copy_;
 
   size_t Allocate(size_t size);                 // Allocate from free_list_
   void Deallocate(size_t offset, size_t size);  // Return to free_list_
