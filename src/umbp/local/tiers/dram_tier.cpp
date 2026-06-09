@@ -33,7 +33,60 @@
 #include <stdexcept>
 #include <thread>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 namespace mori::umbp {
+
+namespace {
+
+#if defined(__x86_64__) || defined(__i386__)
+// Cached (cacheable) AVX-512 copy: regular loads/stores, NOT non-temporal. For
+// blocks that fit L2/L3, this is ~1.7x faster than glibc memcpy / NT stores on
+// Zen4 (glibc switches to non-temporal at a few-hundred-KB and tops out at
+// ~26 GiB/s/core; staying cached holds ~45). x86 host->device DMA is cache
+// coherent (PCIe snoops), so the device reads correct data without a flush.
+__attribute__((target("avx512f"))) void CachedCopyAvx512(char* d, const char* s, size_t n) {
+  size_t i = 0;
+  for (; i + 256 <= n; i += 256) {
+    __m512i a = _mm512_loadu_si512(s + i);
+    __m512i b = _mm512_loadu_si512(s + i + 64);
+    __m512i c = _mm512_loadu_si512(s + i + 128);
+    __m512i e = _mm512_loadu_si512(s + i + 192);
+    _mm512_storeu_si512(reinterpret_cast<void*>(d + i), a);
+    _mm512_storeu_si512(reinterpret_cast<void*>(d + i + 64), b);
+    _mm512_storeu_si512(reinterpret_cast<void*>(d + i + 128), c);
+    _mm512_storeu_si512(reinterpret_cast<void*>(d + i + 192), e);
+  }
+  for (; i + 64 <= n; i += 64) {
+    _mm512_storeu_si512(reinterpret_cast<void*>(d + i), _mm512_loadu_si512(s + i));
+  }
+  if (i < n) std::memcpy(d + i, s + i, n - i);
+}
+bool Avx512Supported() { return __builtin_cpu_supports("avx512f"); }
+#else
+void CachedCopyAvx512(char* d, const char* s, size_t n) { std::memcpy(d, s, n); }
+bool Avx512Supported() { return false; }
+#endif
+
+// Copy one KV block. For sizes up to ~L3 (<= 16 MiB) use the cached AVX-512 path
+// (1.7x over memcpy); fall back to glibc memcpy for huge blocks (where its NT
+// path avoids read-for-ownership and wins). Disable via UMBP_DRAM_CACHED_COPY=0.
+inline void CopyBlock(void* dst, const void* src, size_t size) {
+  static const bool kCached =
+      Avx512Supported() &&
+      !(std::getenv("UMBP_DRAM_CACHED_COPY") &&
+        std::getenv("UMBP_DRAM_CACHED_COPY")[0] == '0');
+  static const size_t kCachedMaxBytes = 16ull << 20;
+  if (kCached && size <= kCachedMaxBytes) {
+    CachedCopyAvx512(static_cast<char*>(dst), static_cast<const char*>(src), size);
+  } else {
+    std::memcpy(dst, src, size);
+  }
+}
+
+}  // namespace
 
 DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name)
     : TierBackend(StorageTier::CPU_DRAM),
@@ -241,7 +294,7 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
 
   if (num_threads <= 1) {
     for (const auto& j : jobs) {
-      std::memcpy(j.dst, j.src, j.size);
+      CopyBlock(j.dst, j.src, j.size);
       results[j.idx] = true;
     }
   } else {
@@ -249,7 +302,7 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
     auto worker = [&]() {
       size_t i;
       while ((i = next.fetch_add(1)) < jobs.size()) {
-        std::memcpy(jobs[i].dst, jobs[i].src, jobs[i].size);
+        CopyBlock(jobs[i].dst, jobs[i].src, jobs[i].size);
       }
     };
     std::vector<std::thread> pool;
