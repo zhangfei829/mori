@@ -42,40 +42,47 @@ namespace mori::umbp {
 namespace {
 
 #if defined(__x86_64__) || defined(__i386__)
-// Non-temporal AVX-512 copy: streaming stores bypass the cache and skip the
-// read-for-ownership (RFO) on dst. This is the right choice for the real
+// Non-temporal AVX2 (256-bit) copy: streaming stores bypass the cache and skip
+// the read-for-ownership (RFO) on dst. This is the right choice for the real
 // batch-get path, where each KV block is read ONCE from cold DRAM and the
 // working set far exceeds L3: a cached copy moves 3x the block bytes through
 // memory (read src + RFO dst + writeback dst), NT moves only 2x (read src +
-// stream-write dst). Measured on Zen4 EPYC, cold 4 MiB blocks, 8 threads
-// (no pinning): NT ~130 GiB/s vs glibc memcpy ~88 vs cached storeu ~75.
+// stream-write dst).
+//
+// Width: AVX2 (256-bit), not AVX-512. On Zen4 the 512-bit datapath is
+// double-pumped over 256-bit units, so 512-bit stream stores give no real
+// width advantage and can trip AVX-512 frequency throttling; the NT bottleneck
+// is the write-combining buffer drain rate, which 256-bit already saturates.
+// Measured cold 4 MiB blocks, 8 threads (no pinning) on Zen4 EPYC:
+//   avx2_nt ~134  >  avx512_nt ~130  >  glibc memcpy ~88  >  cached storeu ~77.
 // dst is a host pinned buffer; sfence orders the streaming stores before the
 // subsequent host->device DMA reads it.
-__attribute__((target("avx512f"))) void NtCopyAvx512(char* d, const char* s, size_t n) {
-  size_t head = (64 - (reinterpret_cast<uintptr_t>(d) & 63)) & 63;
+__attribute__((target("avx2"))) void NtCopyAvx2(char* d, const char* s, size_t n) {
+  size_t head = (32 - (reinterpret_cast<uintptr_t>(d) & 31)) & 31;
   if (head > n) head = n;
   std::memcpy(d, s, head);
   size_t i = head;
-  for (; i + 256 <= n; i += 256) {
-    __m512i a = _mm512_loadu_si512(s + i);
-    __m512i b = _mm512_loadu_si512(s + i + 64);
-    __m512i c = _mm512_loadu_si512(s + i + 128);
-    __m512i e = _mm512_loadu_si512(s + i + 192);
-    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i), a);
-    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i + 64), b);
-    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i + 128), c);
-    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i + 192), e);
+  for (; i + 128 <= n; i += 128) {
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+    __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 32));
+    __m256i c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 64));
+    __m256i e = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 96));
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i), a);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 32), b);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 64), c);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 96), e);
   }
-  for (; i + 64 <= n; i += 64) {
-    _mm512_stream_si512(reinterpret_cast<__m512i*>(d + i), _mm512_loadu_si512(s + i));
+  for (; i + 32 <= n; i += 32) {
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i), a);
   }
   if (i < n) std::memcpy(d + i, s + i, n - i);
   _mm_sfence();
 }
-bool Avx512Supported() { return __builtin_cpu_supports("avx512f"); }
+bool Avx2Supported() { return __builtin_cpu_supports("avx2"); }
 #else
-void NtCopyAvx512(char* d, const char* s, size_t n) { std::memcpy(d, s, n); }
-bool Avx512Supported() { return false; }
+void NtCopyAvx2(char* d, const char* s, size_t n) { std::memcpy(d, s, n); }
+bool Avx2Supported() { return false; }
 #endif
 
 // Copy one KV block. Large blocks (>= 256 KiB, the real KV-page regime, always
@@ -84,12 +91,12 @@ bool Avx512Supported() { return false; }
 // Disable NT via UMBP_DRAM_NT_COPY=0.
 inline void CopyBlock(void* dst, const void* src, size_t size) {
   static const bool kNt =
-      Avx512Supported() &&
+      Avx2Supported() &&
       !(std::getenv("UMBP_DRAM_NT_COPY") &&
         std::getenv("UMBP_DRAM_NT_COPY")[0] == '0');
   static const size_t kNtMinBytes = 256ull << 10;
   if (kNt && size >= kNtMinBytes) {
-    NtCopyAvx512(static_cast<char*>(dst), static_cast<const char*>(src), size);
+    NtCopyAvx2(static_cast<char*>(dst), static_cast<const char*>(src), size);
   } else {
     std::memcpy(dst, src, size);
   }
